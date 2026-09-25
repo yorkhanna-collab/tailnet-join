@@ -67,8 +67,9 @@ function Find-SshDir {
   @((Join-Path $env:SystemRoot 'System32\OpenSSH'), (Join-Path $env:ProgramFiles 'OpenSSH')) | Where-Object { Test-Path (Join-Path $_ 'ssh.exe') } | Select-Object -First 1
 }
 function Invoke-Quiet([string]$Exe, [string]$ArgLine) {
-  # one command-line string: empty arguments such as -N "" survive on every PowerShell version
-  $o = Join-Path $Dir 'stdout.tmp'; $e = Join-Path $Dir 'stderr.tmp'
+  # one command-line string: empty arguments such as -N "" survive on every PowerShell version.
+  # Temp files go in the caller's own TEMP: the tailnet-join folder is admin-write-only.
+  $o = Join-Path $env:TEMP ('tj-out-{0}.tmp' -f [guid]::NewGuid()); $e = Join-Path $env:TEMP ('tj-err-{0}.tmp' -f [guid]::NewGuid())
   $p = Start-Process -FilePath $Exe -ArgumentList $ArgLine -Wait -PassThru -NoNewWindow -RedirectStandardOutput $o -RedirectStandardError $e
   $res = [pscustomobject]@{ code = $p.ExitCode; out = ((Get-Content $o -Raw -ErrorAction SilentlyContinue) -as [string]); err = ((Get-Content $e -Raw -ErrorAction SilentlyContinue) -as [string]) }
   Remove-Item $o, $e -Force -ErrorAction SilentlyContinue

@@ -24,8 +24,23 @@ Assert (($addr -join ',') -match '100\.64\.0\.0') "SSH rule scoped to the tailne
 $open22 = @(Get-NetFirewallPortFilter -Protocol TCP | Where-Object { @($_.LocalPort) -contains '22' } | Get-NetFirewallRule | Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and [string]$_.Enabled -eq 'True' })
 Assert ($open22.Count -eq 1 -and $open22[0].Name -eq 'tailnet-join-ssh') "only the tailnet rule allows port 22 (found: $(($open22 | ForEach-Object { $_.Name }) -join ', '))"
 
-# safe to re-run: same keys, still passes
+# keys only: sshd's effective settings, straight from sshd -T
+$sshd = ([string](Get-CimInstance Win32_Service -Filter "Name='sshd'").PathName) -replace '^"([^"]+)".*$', '$1'
+$ErrorActionPreference = 'Continue'   # Windows PowerShell treats redirected native stderr as errors
+$eff = @(& $sshd -T 2>$null | ForEach-Object { "$_" })
+$ErrorActionPreference = 'Stop'
+Assert (($eff -contains 'passwordauthentication no')) "sshd refuses passwords ($(($eff | Where-Object { $_ -match '^(passwordauth|kbdinteractive)' }) -join '; '))"
+Assert ($r.self_test.ok -eq $true) 'key login still works with passwords off'
+
+# only administrators may write to the folder installers run from
+$dirAcl = (Get-Acl (Join-Path $env:ProgramData 'tailnet-join')).Access
+$usersWrite = @($dirAcl | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18', 'S-1-5-32-544') -and ($_.FileSystemRights.ToString() -match 'Write|Modify|FullControl|CreateFiles|AppendData') })
+Assert ($usersWrite.Count -eq 0) "only SYSTEM and Administrators can write to the tailnet-join folder ($(($usersWrite | ForEach-Object { "$($_.IdentityReference) $($_.FileSystemRights)" }) -join '; '))"
+
+# safe to re-run: same keys, one managed sshd_config block, still passes
 & "$PSScriptRoot\..\join.ps1" -SkipTailscale -NoWait -NoUpload -Name ci-test
 Assert (@(Get-Content $ak).Count -eq $lines.Count) 're-run leaves the key file unchanged'
+$cfgText = [IO.File]::ReadAllText((Join-Path $env:ProgramData 'ssh\sshd_config'))
+Assert (([regex]::Matches($cfgText, '# >>> tailnet-join')).Count -eq 1) 're-run keeps one key-only block in sshd_config'
 Assert ((Get-Report).self_test.ok -eq $true) 'self-test passes on re-run'
 exit 0

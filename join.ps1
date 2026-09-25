@@ -35,7 +35,7 @@ param(
   [switch]$SkipRdp,
   [switch]$NoWait,
   [switch]$NoUpload,
-  [int]$WaitMinutes = 30
+  [int]$WaitMinutes = 45
 )
 
 $ErrorActionPreference = 'Continue'
@@ -45,6 +45,20 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 $Script:Version = '2026-09-24.1'
 $Dir = Join-Path $env:ProgramData 'tailnet-join'
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+# Installers are downloaded here and run as SYSTEM, so only administrators may write here; other accounts may read.
+& icacls.exe $Dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1 | Out-Null
+& icacls.exe $Dir /setowner '*S-1-5-32-544' /T /C 2>&1 | Out-Null
+# The join key arrives on the pasted command line, so PowerShell's saved history holds it: blank it out.
+function Remove-KeyFromHistory {
+  try {
+    $hp = (Get-PSReadLineOption -ErrorAction Stop).HistorySavePath
+    if ($hp -and (Test-Path $hp)) {
+      $t = [IO.File]::ReadAllText($hp)
+      if ($t -match 'tskey-') { [IO.File]::WriteAllText($hp, ($t -replace 'tskey-[A-Za-z0-9-]+', 'tskey-REDACTED'), (New-Object Text.UTF8Encoding($false))) }
+    }
+  } catch {}
+}
+Remove-KeyFromHistory
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $LogFile = Join-Path $Dir "join-$Stamp.log"
 try { Start-Transcript -Path $LogFile -Force | Out-Null } catch {}
@@ -74,6 +88,7 @@ function Try-Run([string]$What, [scriptblock]$Block) {
   try { & $Block } catch { Note 'error' ("{0}: {1}" -f $What, $_.Exception.Message) 'WARN' }
 }
 function Finish {
+  Remove-KeyFromHistory
   try { Stop-Transcript | Out-Null } catch {}
 }
 
@@ -89,8 +104,13 @@ if (-not $IsAdmin) {
   return
 }
 if ($env:PROCESSOR_ARCHITEW6432) { Note 'windows' 'this is the 32-bit PowerShell; the 64-bit "Windows PowerShell" is preferred' 'WARN' }
-# a stale progress log from an earlier run would be replayed in the wait loop
+# a stale progress log from an earlier run would be replayed in the wait loop; start an empty one that the
+# remote setup can append to even when it runs as a standard account
 Remove-Item -Path (Join-Path $Dir 'progress.log'), (Join-Path $Dir 'all-set.txt') -Force -ErrorAction SilentlyContinue
+try {
+  [IO.File]::WriteAllText((Join-Path $Dir 'progress.log'), '', (New-Object Text.ASCIIEncoding))
+  & icacls.exe (Join-Path $Dir 'progress.log') /grant '*S-1-5-32-545:M' 2>&1 | Out-Null
+} catch {}
 
 # =====================================================================================
 # ACCOUNTS - who is at the screen, who elevated, and who gets SSH
@@ -210,23 +230,34 @@ if (-not $SkipTailscale) {
     $tsArch = switch ($Arch) { 'ARM64' { 'arm64' } 'x86' { 'x86' } default { 'amd64' } }
     $msi = Join-Path $Dir "tailscale-setup-$tsArch.msi"
     Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$tsArch.msi" -OutFile $msi -UseBasicParsing -TimeoutSec 300
-    # always run it: installs, or upgrades an old client, and forces unattended mode (runs before anyone signs in)
-    $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "{0}" /quiet /norestart TS_UNATTENDEDMODE=always' -f $msi) -Wait -PassThru
+    # always run it: installs, or upgrades an old client, and forces unattended mode (runs before anyone signs in).
+    # TS_NOLAUNCH + TS_ONBOARDING_FLOW=hide: no Tailscale window or "Log in" prompt pops up mid-setup (signing
+    # in there with the wrong account would create a separate tailnet); TS_INSTALLUPDATES keeps it patched.
+    $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "{0}" /quiet /norestart TS_UNATTENDEDMODE=always TS_ALLOWINCOMINGCONNECTIONS=always TS_NOLAUNCH=1 TS_ONBOARDING_FLOW=hide TS_INSTALLUPDATES=always' -f $msi) -Wait -PassThru
     if (@(0, 3010, 1638) -notcontains $p.ExitCode) { throw "Tailscale installer exit code $($p.ExitCode)" }
+    # a Disconnect click in the tray reconnects by itself an hour later instead of cutting the PC off for good
+    New-Item -Path 'HKLM:\SOFTWARE\Policies\Tailscale' -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Tailscale' -Name ReconnectAfter -Value '1h' -PropertyType String -Force | Out-Null
     Note 'tailscale' ("installed/updated ({0})" -f $tsArch)
   }
-  # wait for the Tailscale service to answer
+  # wait for the service to settle (it restarts after an install or upgrade)
   $st = $null
-  for ($i = 0; $i -lt 30 -and -not ($st -and $st.BackendState); $i++) { Start-Sleep -Seconds 2; $st = Get-TsStatus }
-  if (-not $st) {
+  for ($i = 0; $i -lt 45; $i++) {
+    $st = Get-TsStatus
+    if ($st -and $st.BackendState -and (@('NoState', 'Starting') -notcontains [string]$st.BackendState)) { break }
+    Start-Sleep -Seconds 2
+  }
+  if (-not ($st -and $st.BackendState)) {
     Note 'tailscale' 'Tailscale did not start - tell Claude' 'FAIL'
     Save-Report 'tailscale-failed' | Out-Null
     Finish
     return
   }
-  $onOurs = ($st.BackendState -eq 'Running') -and (-not $Tailnet -or ($st.CurrentTailnet -and $st.CurrentTailnet.Name -eq $Tailnet))
+  $ours = [bool]($st.CurrentTailnet -and (-not $Tailnet -or $st.CurrentTailnet.Name -eq $Tailnet))
+  $prev = $null
   $upOut = ''
-  if ($onOurs) {
+  if ($ours -and $st.HaveNodeKey -and [string]$st.BackendState -ne 'NeedsLogin') {
+    # already one of this tailnet's devices (a re-run or an upgrade): never resend the key
     $upOut = (& $TsExe up --reset --unattended "--hostname=$Name" --timeout=60s 2>&1 | Out-String)
     Note 'tailscale' 'already on the tailnet'
   } elseif (-not $TsKey) {
@@ -234,17 +265,24 @@ if (-not $SkipTailscale) {
     Save-Report 'no-key' | Out-Null
     Finish
     return
-  } elseif ($st.BackendState -eq 'Running') {
-    # signed in to some other tailnet: add ours as a second profile instead of throwing that login away
-    Note 'tailscale' ("this PC was on another tailnet ({0}); adding York's alongside it" -f $st.CurrentTailnet.Name) 'WARN'
+  } elseif ($st.CurrentTailnet -and -not $ours -and $st.HaveNodeKey) {
+    # signed in to some other tailnet: add ours as a second profile, and switch back if ours fails
+    $prev = [string]$st.CurrentTailnet.Name
+    Note 'tailscale' ("this PC was on another tailnet ({0}); adding York's alongside it" -f $prev) 'WARN'
     $upOut = (& $TsExe login "--auth-key=$TsKey" "--hostname=$Name" --timeout=60s 2>&1 | Out-String)
     & $TsExe set --unattended 2>&1 | Out-Null
   } else {
     $upOut = (& $TsExe up --reset "--auth-key=$TsKey" "--hostname=$Name" --unattended --timeout=60s 2>&1 | Out-String)
   }
-  $st = Get-TsStatus
-  $joined = $st -and $st.BackendState -eq 'Running' -and (-not $Tailnet -or ($st.CurrentTailnet -and $st.CurrentTailnet.Name -eq $Tailnet))
+  # a slow first connection can outlast up's own timeout: keep looking for another minute
+  $joined = $false
+  for ($i = 0; $i -lt 20 -and -not $joined; $i++) {
+    $st = Get-TsStatus
+    $joined = [bool]($st -and [string]$st.BackendState -eq 'Running' -and $st.CurrentTailnet -and (-not $Tailnet -or $st.CurrentTailnet.Name -eq $Tailnet))
+    if (-not $joined) { Start-Sleep -Seconds 3 }
+  }
   if (-not $joined) {
+    if ($prev) { & $TsExe switch $prev 2>&1 | Out-Null }
     $why = ($upOut -replace 'tskey-[A-Za-z0-9-]+', 'tskey-***').Trim()
     Note 'tailscale' ("could not join the tailnet (state {0}). The join key may be used up or expired - tell Claude. Details: {1}" -f $st.BackendState, $why) 'FAIL'
     Save-Report 'join-failed' | Out-Null
@@ -252,6 +290,7 @@ if (-not $SkipTailscale) {
     return
   }
   $TsIp = (& $TsExe ip -4 2>$null | Select-Object -First 1)
+  if (-not $TsIp) { $TsIp = @($st.TailscaleIPs | Where-Object { $_ -like '100.*' })[0] }
   $Rep.tailscale = [ordered]@{ state = $st.BackendState; tailnet = $st.CurrentTailnet.Name; host_name = $st.Self.HostName; dns_name = $st.Self.DNSName; ip4 = $TsIp; version = $st.Version }
   Note 'tailscale' ("connected as {0} ({1})" -f $st.Self.DNSName, $TsIp)
   # tell the Mac mini right away, so the account names are known even if a later step fails
@@ -367,7 +406,39 @@ Try-Run 'ssh-firewall' {
   New-NetFirewallRule -Name 'tailnet-join-ssh' -DisplayName 'SSH from the tailnet (tailnet-join)' -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -RemoteAddress $TailnetRanges -Profile Any | Out-Null
   Note 'ssh' ("port 22 open to the tailnet only ({0} other rule(s) for port 22 turned off)" -f $other.Count)
 }
+$SshdExe = $null
+try {
+  $pn = [string](Get-CimInstance Win32_Service -Filter "Name='sshd'").PathName
+  if ($pn -match '^"([^"]+)"') { $SshdExe = $Matches[1] } elseif ($pn -match '^(\S+\.exe)') { $SshdExe = $Matches[1] }
+} catch {}
+if (-not ($SshdExe -and (Test-Path $SshdExe))) { $SshdExe = @((Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'), (Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+Try-Run 'sshd-keyonly' {
+  # Keys only: no password guessing, whatever else can reach port 22. Placed first in the file because the
+  # first value sshd reads wins; checked with sshd -t, and put back exactly as it was if sshd rejects it.
+  $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+  if (-not (Test-Path $cfg)) { throw 'sshd_config is missing' }
+  if (-not $SshdExe) { throw 'sshd.exe not found' }
+  $orig = [IO.File]::ReadAllText($cfg)
+  $body = [regex]::Replace($orig, '(?s)# >>> tailnet-join.*?# <<< tailnet-join <<<\r?\n', '')
+  $enc = New-Object Text.UTF8Encoding($false)
+  $ok = $false
+  foreach ($set in @(@('PasswordAuthentication no', 'KbdInteractiveAuthentication no'), @('PasswordAuthentication no'))) {
+    $block = "# >>> tailnet-join: key-only logins >>>`r`n" + ($set -join "`r`n") + "`r`n# <<< tailnet-join <<<`r`n"
+    [IO.File]::WriteAllText($cfg, $block + $body, $enc)
+    & $SshdExe -t 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+  }
+  if (-not $ok) {
+    [IO.File]::WriteAllText($cfg, $orig, $enc)
+    throw 'sshd rejected the key-only setting, so sshd_config was left as it was'
+  }
+  Note 'ssh' 'password logins turned off: keys only'
+}
 Try-Run 'sshd-restart' { Restart-Service sshd -Force }
+Try-Run 'sshd-effective' {
+  $eff = @(& $SshdExe -T 2>$null | Where-Object { $_ -match '^(passwordauthentication|kbdinteractiveauthentication|allowgroups) ' })
+  $Rep.sshd_effective = $eff
+}
 
 # =====================================================================================
 # 3. REMOTE DESKTOP - only where the Windows edition can host it (not on Home)
@@ -491,6 +562,10 @@ while ((Get-Date) -lt $deadline) {
   }
   if (Test-Path $Marker) { $done = $true; break }
   Start-Sleep -Seconds 3
+}
+if (Test-Path $Progress) {
+  $lines = @(Get-Content -Path $Progress -ErrorAction SilentlyContinue)
+  for ($i = $seen; $i -lt $lines.Count; $i++) { Write-Host ('  > ' + $lines[$i]) }
 }
 try { [void][TailnetJoin.Power]::SetThreadExecutionState($ES_CONTINUOUS) } catch {}
 Write-Host ''
