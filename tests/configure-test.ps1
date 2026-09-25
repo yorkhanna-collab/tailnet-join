@@ -15,13 +15,10 @@ $hf = Join-Path $env:TEMP 'tj-hosts.json'
 & "$PSScriptRoot\..\configure.ps1" -HostsFile $hf -Part machine | Out-Host
 $viewer = Get-ChildItem "$env:ProgramFiles\RealVNC" -Recurse -Include 'rvncconnect.exe', 'vncviewer.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
 Assert ([bool]$viewer) "RealVNC Viewer installed ($($viewer.FullName))"
-# a .vnc file only opens with a double-click if Windows maps .vnc to the viewer
-$assoc = (cmd /c assoc .vnc 2>&1 | Out-String).Trim()
-$progId = ($assoc -split '=', 2)[-1]
-$ftype = (cmd /c ftype $progId 2>&1 | Out-String).Trim()
-$openCmd = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\$progId\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
-Write-Host "assoc: $assoc | ftype: $ftype | open: $openCmd"
-Assert (($assoc -match '^\.vnc=') -and (("$ftype $openCmd") -match 'rvncconnect|vncviewer')) '.vnc files open with RealVNC'
+# the screen shortcuts use the same invocation as RealVNC's own link handler
+$handler = (Get-ItemProperty 'Registry::HKEY_CLASSES_ROOT\com.realvnc.vncviewer.connect\shell\open\command' -ErrorAction SilentlyContinue).'(default)'
+Write-Host "RealVNC link handler: $handler"
+Assert ($handler -match 'rvncconnect\.exe"?\s+-uri') 'RealVNC link handler registered as rvncconnect.exe -uri'
 
 & "$PSScriptRoot\..\configure.ps1" -HostsFile $hf -Part user | Out-Host
 $key = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
@@ -51,13 +48,13 @@ $folder = Join-Path ([Environment]::GetFolderPath('Desktop')) 'My Computers'
 Assert (Test-Path (Join-Path $folder 'This runner, terminal.cmd')) 'terminal shortcut'
 Assert (Test-Path (Join-Path $folder 'This runner, remote desktop (after hours).rdp')) 'remote desktop file'
 Assert (Test-Path (Join-Path $folder 'Fake Mac, terminal.cmd')) 'mac terminal shortcut'
-$vncPath = Join-Path $folder 'Fake Mac, screen.vnc'
-Assert (Test-Path $vncPath) 'mac screen connection file'
-Assert-PlainAscii $vncPath
-$vncText = Get-Content $vncPath -Raw
-Assert ($vncText -match '(?m)^Host=127\.0\.0\.1' -and $vncText -match '(?m)^UserName=someone') "screen file points at the Mac with its user ($($vncText -replace "`r`n", ' | '))"
+$lnkPath = Join-Path $folder 'Fake Mac, screen.lnk'
+Assert (Test-Path $lnkPath) 'mac screen shortcut'
+$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($lnkPath)
+Assert ($lnk.TargetPath -like '*rvncconnect.exe') "screen shortcut opens RealVNC ($($lnk.TargetPath))"
+Assert ($lnk.Arguments -eq '-uri com.realvnc.vncviewer.connect://127.0.0.1') "screen shortcut connects straight to the Mac ($($lnk.Arguments))"
 $prefs = Get-ItemProperty 'HKCU:\Software\RealVNC\rvncconnect'
-Assert ($prefs.WarnUnencrypted -eq 'FALSE' -and $prefs.ShowSplash -eq 'FALSE' -and $prefs.AllowSignIn -eq 'FALSE') 'viewer prefs written'
+Assert ($prefs.WarnUnencrypted -eq 'FALSE' -and $prefs.ShowSplash -eq 'FALSE' -and $prefs.AllowSignIn -eq 'FALSE' -and $prefs.UriSuppressConnectionPrompt -eq 'TRUE') 'viewer prefs written'
 
 & "$PSScriptRoot\..\configure.ps1" -Done -Message 'CI done' | Out-Null
 Assert ((Get-Content (Join-Path $env:ProgramData 'tailnet-join\all-set.txt') -Raw) -eq 'CI done') 'all-set marker written'

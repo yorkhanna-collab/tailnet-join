@@ -75,10 +75,10 @@ function Invoke-Quiet([string]$Exe, [string]$ArgLine) {
   return $res
 }
 function Set-PrivateAcl([string]$Path, [string]$Sid) {
-  $a = & icacls.exe $Path /setowner "*$Sid" 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "icacls /setowner ${Path}: $a" }
-  $b = & icacls.exe $Path /inheritance:r /grant:r "*${Sid}:F" '*S-1-5-18:F' '*S-1-5-32-544:F' 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "icacls ${Path}: $b" }
+  $r = Invoke-Quiet 'icacls.exe' ('"{0}" /setowner "*{1}"' -f $Path, $Sid)
+  if ($r.code -ne 0) { throw "icacls /setowner ${Path}: $($r.out) $($r.err)" }
+  $r = Invoke-Quiet 'icacls.exe' ('"{0}" /inheritance:r /grant:r "*{1}:F" "*S-1-5-18:F" "*S-1-5-32-544:F"' -f $Path, $Sid)
+  if ($r.code -ne 0) { throw "icacls ${Path}: $($r.out) $($r.err)" }
 }
 function Test-Tcp([string]$Ip, [int]$Port, [bool]$ReadBanner) {
   $c = New-Object Net.Sockets.TcpClient
@@ -186,7 +186,7 @@ if (@('user', 'all') -contains $Part) {
   # Connect Viewer 8 keeps its settings under rvncconnect, older viewers under vncviewer: set both.
   foreach ($rk in @('HKCU:\Software\RealVNC\rvncconnect', 'HKCU:\Software\RealVNC\vncviewer')) {
     New-Item -Path $rk -Force | Out-Null
-    foreach ($kv in @(@('ShowSplash', 'FALSE'), @('AllowSignIn', 'FALSE'), @('WarnUnencrypted', 'FALSE'), @('SecurityNotificationTimeout', '0'), @('EnableAnalytics', 'FALSE'), @('Scaling', 'AspectFit'))) {
+    foreach ($kv in @(@('ShowSplash', 'FALSE'), @('AllowSignIn', 'FALSE'), @('WarnUnencrypted', 'FALSE'), @('SecurityNotificationTimeout', '0'), @('EnableAnalytics', 'FALSE'), @('Scaling', 'AspectFit'), @('UriSuppressConnectionPrompt', 'TRUE'))) {
       New-ItemProperty -Path $rk -Name $kv[0] -Value $kv[1] -PropertyType String -Force | Out-Null
     }
   }
@@ -198,6 +198,7 @@ if (@('user', 'all') -contains $Part) {
   New-Item -ItemType Directory -Force -Path $folder | Out-Null
   $ssh = Join-Path $bin 'ssh.exe'
   $vnc = Find-VncViewer
+  $wsh = New-Object -ComObject WScript.Shell
   $made = New-Object System.Collections.ArrayList
   foreach ($h in $Hosts) {
     $label = [string]$h.label
@@ -206,12 +207,21 @@ if (@('user', 'all') -contains $Part) {
     [IO.File]::WriteAllText($cmdPath, $cmdText, $Ascii)
     [void]$made.Add((Split-Path $cmdPath -Leaf))
     if ($h.kind -eq 'mac') {
-      # a RealVNC connection file: double-click opens the viewer straight at the Mac's own login box
-      $vncPath = Join-Path $folder ('{0}, screen.vnc' -f $label)
-      $vncText = "ConnMethod=tcp`r`nFriendlyName=$label`r`nHost=$($h.ip)`r`nUserName=$($h.user)`r`nWarnUnencrypted=0`r`nScaling=AspectFit`r`n"
-      [IO.File]::WriteAllText($vncPath, $vncText, $Ascii)
-      [void]$made.Add((Split-Path $vncPath -Leaf))
-      if (-not $vnc) { Say "RealVNC is not installed yet, so $label's screen file will not open until it is" }
+      if ($vnc) {
+        # Connect Viewer 8 (rvncconnect.exe) opens a direct connection the same way its own link handler
+        # does (-uri com.realvnc.vncviewer.connect://host); RealVNC 8 registers no .vnc file type.
+        # An older vncviewer.exe takes the address (and user name) directly.
+        $lnkPath = Join-Path $folder ('{0}, screen.lnk' -f $label)
+        $lnk = $wsh.CreateShortcut($lnkPath)
+        $lnk.TargetPath = $vnc
+        if ((Split-Path $vnc -Leaf) -ieq 'rvncconnect.exe') { $lnk.Arguments = ('-uri com.realvnc.vncviewer.connect://{0}' -f $h.ip) }
+        else { $lnk.Arguments = ('-UserName={0} {1}' -f $h.user, $h.ip) }
+        $lnk.WorkingDirectory = (Split-Path $vnc)
+        $lnk.IconLocation = "$vnc,0"
+        $lnk.Description = "$label screen over the tailnet (Mac user name: $($h.user))"
+        $lnk.Save()
+        [void]$made.Add((Split-Path $lnkPath -Leaf))
+      } else { Say "RealVNC is not installed yet, so there is no screen shortcut for $label" }
     }
     if ($h.kind -eq 'windows') {
       $note = if ($h.rdp_note) { " ($($h.rdp_note))" } else { '' }
@@ -234,8 +244,11 @@ if (@('verify', 'all') -contains $Part) {
   $ssh = Join-Path $bin 'ssh.exe'
   $checks = New-Object System.Collections.ArrayList
   foreach ($h in $Hosts) {
-    $out = & $ssh -o BatchMode=yes -o ConnectTimeout=12 ([string]$h.alias) hostname 2>&1 | Out-String
+    # Windows PowerShell turns native stderr into error records; under 'Stop' the first one would end the script
+    $ErrorActionPreference = 'Continue'
+    $out = (& $ssh -o BatchMode=yes -o ConnectTimeout=12 -o LogLevel=ERROR ([string]$h.alias) hostname 2>&1 | ForEach-Object { "$_" }) -join "`n"
     $sshOk = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
     $port = if ($h.kind -eq 'mac') { 5900 } else { 3389 }
     $state = Test-Tcp -Ip ([string]$h.ip) -Port $port -ReadBanner ($h.kind -eq 'mac')
     [void]$checks.Add([pscustomobject]@{ alias = [string]$h.alias; ssh_ok = $sshOk; ssh_output = $out.Trim(); port = $port; port_state = $state })

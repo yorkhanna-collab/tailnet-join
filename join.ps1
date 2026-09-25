@@ -411,7 +411,7 @@ Try-Run 'self-test' {
   $grants = if ($Target.is_admin) { @($SidSystem, $SidAdmins) } else { @($Target.sid, $SidSystem, $SidAdmins) }
   Set-KeyFile -Path $file -Add @($pub) -OwnerSid $owner -GrantSids $grants
   try {
-    $out = & (Join-Path $SshBinDir 'ssh.exe') -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ConnectTimeout=20 -l $Target.ssh_login 127.0.0.1 whoami 2>&1 | Out-String
+    $out = (& (Join-Path $SshBinDir 'ssh.exe') -i $key -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR -o ConnectTimeout=20 -l $Target.ssh_login 127.0.0.1 whoami 2>&1 | ForEach-Object { "$_" }) -join "`n"
     $SelfTest.output = $out.Trim()
     $SelfTest.ok = ($LASTEXITCODE -eq 0) -and ($out -match [regex]::Escape($Target.sam))
   } finally {
