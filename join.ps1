@@ -343,6 +343,18 @@ Try-Run 'ssh-keys' {
       Set-KeyFile -Path $UserKeyFile -Add $AdminKeys -OwnerSid $Target.sid -GrantSids @($Target.sid, $SidSystem, $SidAdmins)
       Note 'ssh' ("keys also authorized for the standard account {0}" -f $Target.sam)
     } else { Note 'ssh' ("{0} has no profile folder yet, so only administrator logins are set up" -f $Target.sam) 'WARN' }
+    # Newer Windows ships sshd_config with 'AllowGroups administrators "openssh users"': a standard
+    # account can only log in over SSH if it is in the local OpenSSH Users group.
+    $allow = @(Get-Content -Path (Join-Path $env:ProgramData 'ssh\sshd_config') -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*AllowGroups\s' })
+    if ($allow.Count -gt 0) {
+      if (($allow -join ' ') -match 'openssh users') {
+        if (-not (Get-LocalGroup -Name 'OpenSSH Users' -ErrorAction SilentlyContinue)) { New-LocalGroup -Name 'OpenSSH Users' -Description 'Members may log in with OpenSSH' | Out-Null }
+        if (-not (Get-LocalGroupMember -Group 'OpenSSH Users' -ErrorAction SilentlyContinue | Where-Object { $_.SID -and $_.SID.Value -eq $Target.sid })) {
+          Add-LocalGroupMember -Group 'OpenSSH Users' -Member $Target.sid
+        }
+        Note 'ssh' ("{0} is in the OpenSSH Users group (this Windows only lets administrators and that group log in over SSH)" -f $Target.sam)
+      } else { Note 'ssh' ("sshd_config limits SSH logins to: {0}" -f ($allow -join '; ')) 'WARN' }
+    }
   }
 }
 

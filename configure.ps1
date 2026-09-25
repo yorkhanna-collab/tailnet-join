@@ -48,11 +48,16 @@ function Say([string]$Msg) {
   try { [IO.File]::AppendAllText($ProgressLog, $Msg + "`r`n", $Ascii) } catch {}
 }
 function Find-VncViewer {
+  # RealVNC Connect Viewer 8 is rvncconnect.exe (older viewers were vncviewer.exe)
+  try {
+    $loc = (Get-ItemProperty 'HKLM:\SOFTWARE\RealVNC\installer\rvncconnect' -ErrorAction Stop).InstallLocation
+    if ($loc -and (Test-Path (Join-Path $loc 'rvncconnect.exe'))) { return (Join-Path $loc 'rvncconnect.exe') }
+  } catch {}
   foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
     if (-not $root) { continue }
     $base = Join-Path $root 'RealVNC'
     if (Test-Path $base) {
-      $exe = Get-ChildItem -Path $base -Recurse -Filter 'vncviewer.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+      $exe = Get-ChildItem -Path $base -Recurse -Include 'rvncconnect.exe', 'vncviewer.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
       if ($exe) { return $exe.FullName }
     }
   }
@@ -177,11 +182,13 @@ if (@('user', 'all') -contains $Part) {
   Set-PrivateAcl -Path $cfgPath -Sid $sid
   Say ('SSH shortcuts set up for: ' + (($Hosts | ForEach-Object { $_.alias }) -join ', '))
 
-  # RealVNC Viewer: no sign-in screen, no "unencrypted" nag (the tailnet already encrypts), no analytics
-  $rk = 'HKCU:\Software\RealVNC\vncviewer'
-  New-Item -Path $rk -Force | Out-Null
-  foreach ($kv in @(@('ShowSplash', 'FALSE'), @('AllowSignIn', 'FALSE'), @('WarnUnencrypted', 'FALSE'), @('SecurityNotificationTimeout', '0'), @('EnableAnalytics', 'FALSE'), @('Scaling', 'AspectFit'))) {
-    New-ItemProperty -Path $rk -Name $kv[0] -Value $kv[1] -PropertyType String -Force | Out-Null
+  # RealVNC Viewer: no sign-in screen, no "unencrypted" nag (the tailnet already encrypts), no analytics.
+  # Connect Viewer 8 keeps its settings under rvncconnect, older viewers under vncviewer: set both.
+  foreach ($rk in @('HKCU:\Software\RealVNC\rvncconnect', 'HKCU:\Software\RealVNC\vncviewer')) {
+    New-Item -Path $rk -Force | Out-Null
+    foreach ($kv in @(@('ShowSplash', 'FALSE'), @('AllowSignIn', 'FALSE'), @('WarnUnencrypted', 'FALSE'), @('SecurityNotificationTimeout', '0'), @('EnableAnalytics', 'FALSE'), @('Scaling', 'AspectFit'))) {
+      New-ItemProperty -Path $rk -Name $kv[0] -Value $kv[1] -PropertyType String -Force | Out-Null
+    }
   }
 
   # the desktop folder
@@ -191,7 +198,6 @@ if (@('user', 'all') -contains $Part) {
   New-Item -ItemType Directory -Force -Path $folder | Out-Null
   $ssh = Join-Path $bin 'ssh.exe'
   $vnc = Find-VncViewer
-  $wsh = New-Object -ComObject WScript.Shell
   $made = New-Object System.Collections.ArrayList
   foreach ($h in $Hosts) {
     $label = [string]$h.label
@@ -200,17 +206,12 @@ if (@('user', 'all') -contains $Part) {
     [IO.File]::WriteAllText($cmdPath, $cmdText, $Ascii)
     [void]$made.Add((Split-Path $cmdPath -Leaf))
     if ($h.kind -eq 'mac') {
-      if ($vnc) {
-        $lnkPath = Join-Path $folder ('{0}, screen.lnk' -f $label)
-        $lnk = $wsh.CreateShortcut($lnkPath)
-        $lnk.TargetPath = $vnc
-        $lnk.Arguments = ('-UserName={0} -WarnUnencrypted=FALSE -Scaling=AspectFit {1}' -f $h.user, $h.ip)
-        $lnk.WorkingDirectory = (Split-Path $vnc)
-        $lnk.IconLocation = "$vnc,0"
-        $lnk.Description = "$label screen over the tailnet"
-        $lnk.Save()
-        [void]$made.Add((Split-Path $lnkPath -Leaf))
-      } else { Say "RealVNC is not installed yet, so there is no screen shortcut for $label" }
+      # a RealVNC connection file: double-click opens the viewer straight at the Mac's own login box
+      $vncPath = Join-Path $folder ('{0}, screen.vnc' -f $label)
+      $vncText = "ConnMethod=tcp`r`nFriendlyName=$label`r`nHost=$($h.ip)`r`nUserName=$($h.user)`r`nWarnUnencrypted=0`r`nScaling=AspectFit`r`n"
+      [IO.File]::WriteAllText($vncPath, $vncText, $Ascii)
+      [void]$made.Add((Split-Path $vncPath -Leaf))
+      if (-not $vnc) { Say "RealVNC is not installed yet, so $label's screen file will not open until it is" }
     }
     if ($h.kind -eq 'windows') {
       $note = if ($h.rdp_note) { " ($($h.rdp_note))" } else { '' }
