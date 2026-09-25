@@ -422,8 +422,9 @@ Try-Run 'sshd-keyonly' {
   $body = [regex]::Replace($orig, '(?s)# >>> tailnet-join.*?# <<< tailnet-join <<<\r?\n', '')
   $enc = New-Object Text.UTF8Encoding($false)
   $ok = $false
-  # newer OpenSSH calls it KbdInteractiveAuthentication, the older one (Windows 10's) ChallengeResponseAuthentication
-  foreach ($set in @(@('PasswordAuthentication no', 'KbdInteractiveAuthentication no'), @('PasswordAuthentication no', 'ChallengeResponseAuthentication no'), @('PasswordAuthentication no'))) {
+  # Older OpenSSH (Windows 10 / Server 2022) turns keyboard-interactive back on whenever ChallengeResponseAuthentication
+  # is on, so both must be off; newer OpenSSH treats the two names as one setting.
+  foreach ($set in @(@('PasswordAuthentication no', 'KbdInteractiveAuthentication no', 'ChallengeResponseAuthentication no'), @('PasswordAuthentication no', 'ChallengeResponseAuthentication no'), @('PasswordAuthentication no'))) {
     $block = "# >>> tailnet-join: key-only logins >>>`r`n" + ($set -join "`r`n") + "`r`n# <<< tailnet-join <<<`r`n"
     [IO.File]::WriteAllText($cfg, $block + $body, $enc)
     & $SshdExe -t 2>&1 | Out-Null
