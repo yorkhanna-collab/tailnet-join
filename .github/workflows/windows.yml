@@ -1,0 +1,56 @@
+name: windows
+# Runs both scripts end to end under Windows PowerShell 5.1 (what a home PC's admin PowerShell is)
+# before anyone pastes the one-liner. Tailscale is skipped: CI can't join the tailnet.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell version and edition
+        run: |
+          $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' | Select-Object ProductName, EditionID, DisplayVersion | Format-List | Out-String | Write-Host
+          Get-Service sshd -ErrorAction SilentlyContinue | Format-List Name, Status, StartType | Out-String | Write-Host
+      - name: Parse under Windows PowerShell 5.1, ASCII only
+        run: |
+          foreach ($f in @('join.ps1', 'configure.ps1', 'tests\assert.ps1', 'tests\admin-path.ps1', 'tests\standard-user.ps1', 'tests\configure-test.ps1')) {
+            $path = (Resolve-Path $f).Path
+            $errs = $null; $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errs)
+            if ($errs.Count) { $errs | Format-List | Out-String | Write-Host; throw "$f has parse errors" }
+            if ([IO.File]::ReadAllBytes($path) | Where-Object { $_ -gt 127 }) { throw "$f has non-ASCII bytes" }
+          }
+          Write-Host 'parse ok'
+      - name: join.ps1 as an administrator
+        run: .\tests\admin-path.ps1
+      - name: join.ps1 for a standard account
+        run: .\tests\standard-user.ps1
+      - name: configure.ps1 machine, user, verify, done
+        run: .\tests\configure-test.ps1
+      - name: Collect logs
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "$env:ProgramData\tailnet-join\*" out -Recurse -Force -ErrorAction SilentlyContinue
+          Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 300 -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message | Out-File out\sshd-events.txt
+          Copy-Item "$env:ProgramData\ssh\sshd_config" out -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.os }}
+          path: out
