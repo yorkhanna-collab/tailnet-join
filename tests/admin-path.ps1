@@ -29,7 +29,8 @@ $sshd = ([string](Get-CimInstance Win32_Service -Filter "Name='sshd'").PathName)
 $ErrorActionPreference = 'Continue'   # Windows PowerShell treats redirected native stderr as errors
 $eff = @(& $sshd -T 2>$null | ForEach-Object { "$_" })
 $ErrorActionPreference = 'Stop'
-Assert (($eff -contains 'passwordauthentication no')) "sshd refuses passwords ($(($eff | Where-Object { $_ -match '^(passwordauth|kbdinteractive)' }) -join '; '))"
+Assert (($eff -contains 'passwordauthentication no')) "sshd refuses passwords ($(($eff | Where-Object { $_ -match '^(passwordauth|kbdinteractive|challengeresponse)' }) -join '; '))"
+Assert ((@($eff | Where-Object { $_ -match '^(kbdinteractiveauthentication|challengeresponseauthentication) yes' }).Count -eq 0)) 'keyboard-interactive logins are off too'
 Assert ($r.self_test.ok -eq $true) 'key login still works with passwords off'
 
 # only administrators may write to the folder installers run from
